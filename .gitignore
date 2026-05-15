@@ -1,0 +1,16 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Future tooling
+node_modules/
+dist/
+
+# Local-only state
+*.local.*
