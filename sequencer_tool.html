@@ -201,6 +201,7 @@
     <input type="file" id="projectFile" accept=".json" style="display:none" onchange="loadProject(this)">
     <span class="btn btn-ghost btn-sm">Load</span>
   </label>
+  <button class="btn btn-ghost btn-sm" onclick="manageModalOpen()" title="View, load, or delete deployed sequences">📋 Sequences</button>
   <div class="sep"></div>
   <!-- Deploy status — shows whether the project folder has been picked. -->
   <span id="deployStatus" class="lbl" style="font-size:11px;color:var(--muted)" title="Click 'Apply to Controllers' to set up the project folder.">📁 No project folder</span>
@@ -223,6 +224,17 @@
       <div class="board-tabs">
         <div class="board-tab active-bs" id="tab-bs" onclick="setBoard('BS')">BS</div>
         <div class="board-tab" id="tab-dc" onclick="setBoard('DC')">DC</div>
+      </div>
+    </div>
+
+    <div class="sb-sect">
+      <h3>Wrapper Mask <span id="wrapperBoardLabel" style="font-size:10px;color:var(--accent);text-transform:none;letter-spacing:0"></span></h3>
+      <div class="field">
+        <select id="wrapperMaskSel" onchange="setWrapperMask(this.value)"
+          style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:5px 7px;border-radius:4px;font-size:12px;width:100%"></select>
+        <div style="font-size:10px;color:var(--muted);margin-top:5px;line-height:1.4">
+          Servo group the generated wrapper plays the sequence on. Narrow this to deploy the same routine as different wrappers (e.g. CPU-only vs all panels).
+        </div>
       </div>
     </div>
 
@@ -333,6 +345,24 @@
   </div>
 </div>
 
+<!-- ──────────────────────────────────────────────────────────────────────
+     Manage Sequences modal — lists every entry from sequences/_manifest.json
+     so the user can re-load a previously deployed sequence into the editor
+     or delete one (which strips its wrapper + case from both .ino files,
+     removes the SeqXxxBS/SeqXxxDC arrays from ServoSequencer.h, and frees
+     its auto-injection function-index slot).
+     ────────────────────────────────────────────────────────────────────── -->
+<div id="manageModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:9999;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;width:720px;max-width:92vw;max-height:85vh;display:flex;flex-direction:column">
+    <div style="padding:12px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">
+      <span style="flex:1;font-weight:700;font-size:14px">📋 Deployed Sequences</span>
+      <button class="btn btn-ghost btn-sm" onclick="manageModalClose()" style="padding:4px 10px">✕</button>
+    </div>
+    <div id="manageBody" style="flex:1;overflow-y:auto;padding:8px 12px"></div>
+    <div id="manageFooter" style="padding:8px 18px;border-top:1px solid var(--border);font-size:11px;color:var(--muted);display:flex;justify-content:space-between;align-items:center;gap:10px"></div>
+  </div>
+</div>
+
 <script>
 // ═══════════════════════════════════════════════════════════════════════════
 //  SERVO & MASK DEFINITIONS
@@ -395,6 +425,13 @@ const MASKS = {
 // ═══════════════════════════════════════════════════════════════════════════
 
 let activeBoard  = 'BS';
+// Per-board mask passed to SEQUENCE_PLAY_ONCE_VARSPEED inside the generated
+// wrapper. Default ALL_SERVOS_MASK = every servo on the board responds to the
+// per-beat bitmask in the sequence array. Narrowing this (e.g. CPU_SERVOS)
+// makes the wrapper play only the masked subset even if more bits are set
+// in the sequence — useful for deploying the same sequence twice as
+// different wrappers, each targeting a different servo group.
+const wrapperMasks = { BS: 'ALL_SERVOS_MASK', DC: 'ALL_SERVOS_MASK' };
 let exportTab    = 'BS';
 let selectedRow  = -1;
 let armedMask    = null;   // { servos: [...] } or null
@@ -888,7 +925,26 @@ function setBoard(b) {
   $('rowLabel').textContent = '';
   renderMasks();
   renderGrid();
+  renderWrapperMask();
   updateExport();
+}
+
+function renderWrapperMask() {
+  const sel = $('wrapperMaskSel');
+  if (!sel) return;
+  const masks = MASKS[activeBoard];
+  const cur   = wrapperMasks[activeBoard];
+  // Make sure the currently-selected value stays visible even if it's a name
+  // not present in MASKS (e.g. loaded from an older project file).
+  const names = masks.map(m => m.name);
+  if (!names.includes(cur)) names.unshift(cur);
+  sel.innerHTML = names.map(n =>
+    `<option value="${n}"${n === cur ? ' selected' : ''}>${n}</option>`
+  ).join('');
+  $('wrapperBoardLabel').textContent = `· ${activeBoard}`;
+}
+function setWrapperMask(name) {
+  wrapperMasks[activeBoard] = name;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1142,7 +1198,8 @@ function saveProject() {
   const data = {
     name: $('seqName').value, bpm: getBpm(), numBeats: getN(),
     pulseWidth: getPulse(), initOffset: getOffset(),
-    grids: { BS: grids.BS, DC: grids.DC }
+    grids: { BS: grids.BS, DC: grids.DC },
+    masks: { BS: wrapperMasks.BS, DC: wrapperMasks.DC }
   };
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
@@ -1164,7 +1221,9 @@ function loadProject(input) {
       $('initOffset').value = d.initOffset || 17;
       if (d.grids?.BS) grids.BS = d.grids.BS;
       if (d.grids?.DC) grids.DC = d.grids.DC;
-      updateBeatDisplay(); renderMasks(); renderGrid(); updateExport();
+      wrapperMasks.BS = d.masks?.BS || 'ALL_SERVOS_MASK';
+      wrapperMasks.DC = d.masks?.DC || 'ALL_SERVOS_MASK';
+      updateBeatDisplay(); renderMasks(); renderGrid(); renderWrapperMask(); updateExport();
       toast('Project loaded');
     } catch (err) { alert('Load failed: ' + err.message); }
   };
@@ -1682,41 +1741,42 @@ function generateCaseLine(baseName, funcIndex) {
   return `          case ${funcIndex}: ${fn}(D_command[1],D_command[3],D_command[4],D_command[5],D_command[6]); break;`;
 }
 
-// ─── Patch one controller (.ino) file ─────────────────────────────────────
-// Reads, ensures markers, splices the wrapper + case into the right regions,
-// returns the new content. Multi-sequence: rebuilds the entire managed region
-// from the manifest so re-saves and deletes are consistent.
-function patchController(content, boardName, manifest, baseName, funcIndex, mask) {
+// ─── Rebuild the managed regions of one controller (.ino) from a sequence list
+// Shared by the apply + delete paths so wrapper/case regions stay consistent
+// regardless of which side mutated the manifest.
+function rebuildControllerRegions(content, boardName, sequences) {
   content = ensureMarkersExist(content, boardName);
 
-  // Rebuild wrapper region: one wrapper per manifested sequence, plus the
-  // current (possibly new) sequence. Newer manifests track this fully.
-  const ourEntry = { name: baseName, functionIndex: funcIndex, masks: { BS: 'ALL_SERVOS_MASK', DC: 'ALL_SERVOS_MASK' } };
-  // Merge into manifest snapshot for code-gen (do NOT mutate the caller's manifest here)
-  const merged = manifest.sequences.filter(s => s.name !== baseName).concat([{
-    ...(manifest.sequences.find(s => s.name === baseName) || {}),
-    name: baseName,
-    functionIndex: funcIndex,
-    masks: { ...(manifest.sequences.find(s => s.name === baseName)?.masks || {}), [boardName]: mask },
-  }]);
+  const sorted = [...sequences].sort((a, b) => a.functionIndex - b.functionIndex);
+  const defMask = DEPLOY.CONTROLLERS[boardName].defaultMask;
 
-  // Wrapper region
-  const wrappers = merged
-    .sort((a, b) => a.functionIndex - b.functionIndex)
-    .map(s => generateWrapper(boardName, s.name, s.functionIndex, (s.masks && s.masks[boardName]) || DEPLOY.CONTROLLERS[boardName].defaultMask))
+  const wrappers = sorted
+    .map(s => generateWrapper(boardName, s.name, s.functionIndex, (s.masks && s.masks[boardName]) || defMask))
     .join('\n');
   content = replaceRegion(content, DEPLOY.MARK.wrapStart, DEPLOY.MARK.wrapEnd, wrappers);
   if (content === null) throw new Error(`[${boardName}] wrapper region replace failed`);
 
-  // Case region
-  const cases = merged
-    .sort((a, b) => a.functionIndex - b.functionIndex)
+  const cases = sorted
     .map(s => generateCaseLine(s.name, s.functionIndex))
     .join('\n');
   content = replaceRegion(content, DEPLOY.MARK.caseStart, DEPLOY.MARK.caseEnd, cases, '          ');
   if (content === null) throw new Error(`[${boardName}] case region replace failed`);
 
   return content;
+}
+
+// ─── Patch one controller (.ino) file for an add/re-save ──────────────────
+// Builds a merged manifest snapshot (existing + current entry) and hands it
+// to rebuildControllerRegions. Does NOT mutate the caller's manifest.
+function patchController(content, boardName, manifest, baseName, funcIndex, mask) {
+  const prior = manifest.sequences.find(s => s.name === baseName) || {};
+  const merged = manifest.sequences.filter(s => s.name !== baseName).concat([{
+    ...prior,
+    name: baseName,
+    functionIndex: funcIndex,
+    masks: { ...(prior.masks || {}), [boardName]: mask },
+  }]);
+  return rebuildControllerRegions(content, boardName, merged);
 }
 
 // ─── Patch ServoSequencer.h (already supported by modifyLibrary, but we
@@ -1882,7 +1942,7 @@ async function deployPreflight(root) {
     const p = `${info.folder}/${info.file}`;
     try {
       const fh = await getFileHandlePath(root, [info.folder, info.file]);
-      plan.controllers[name] = { handle: fh, path: p, mask: info.defaultMask };
+      plan.controllers[name] = { handle: fh, path: p, mask: wrapperMasks[name] || info.defaultMask };
       deployLog(`Found ${p}`, 'ok');
     } catch (e) {
       plan.missing.push(p);
@@ -2050,6 +2110,295 @@ async function deployConfirm() {
   finally { $('deployConfirmBtn').disabled = false; _deployPendingWrites = null; }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  MANAGE DEPLOYED SEQUENCES
+//
+//  Lists everything in sequences/_manifest.json with [Load] and [Delete]
+//  actions. Load reads sequences/<name>.json and populates the editor. Delete
+//  rebuilds both .ino marker regions from manifest-minus-this-entry, strips
+//  the SeqXxxBS/SeqXxxDC arrays from ServoSequencer.h, deletes the per-
+//  sequence JSON, and writes the updated manifest — freeing the function-
+//  index slot for reuse.
+// ═══════════════════════════════════════════════════════════════════════════
+
+function manageEscape(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function manageModalOpen() {
+  $('manageModal').style.display = 'flex';
+  $('manageBody').innerHTML = '<div style="padding:24px;text-align:center;color:var(--muted)">Loading…</div>';
+  $('manageFooter').innerHTML = '';
+
+  let root;
+  try {
+    root = await deployGetRoot();
+    deployUpdateStatus();
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      $('manageBody').innerHTML = '<div style="padding:24px;text-align:center;color:var(--muted)">Folder picker cancelled.</div>';
+    } else {
+      $('manageBody').innerHTML = `<div style="padding:24px;text-align:center;color:#ff6b6b">Couldn't access folder: ${manageEscape(e.message)}</div>`;
+    }
+    return;
+  }
+
+  try {
+    const manifest    = await readManifest(root);
+    const inventory   = await readHandwrittenInventory(root, manifest.sequences || []);
+    renderManageList(manifest.sequences || [], inventory);
+  } catch (e) {
+    $('manageBody').innerHTML = `<div style="padding:24px;text-align:center;color:#ff6b6b">Couldn't read project files: ${manageEscape(e.message)}</div>`;
+    console.error(e);
+  }
+}
+
+// Walks both .ino files and ServoSequencer.h to build a read-only inventory
+// of stuff the tool didn't author. Used by the manage modal so the user can
+// see every case index that's already taken (so they know what :DxXX commands
+// work today) and every Seq* array already defined in the library header.
+async function readHandwrittenInventory(root, managedSequences) {
+  const managedIdx = new Set(managedSequences.map(s => s.functionIndex));
+  const managedBaseNames = new Set(managedSequences.map(s => s.name));
+
+  // ── Dispatch cases per .ino, keyed by index ──
+  // cases[idx] = { BS: 'funcName', DC: 'funcName' }
+  const cases = {};
+  for (const [board, info] of Object.entries(DEPLOY.CONTROLLERS)) {
+    try {
+      const fh   = await getFileHandlePath(root, [info.folder, info.file]);
+      const text = await readFileText(fh);
+      const managedRegion = findRegion(text, DEPLOY.MARK.caseStart, DEPLOY.MARK.caseEnd);
+      // Match the top-level dispatch shape only — first arg is D_command[...] or
+      // a literal digit (cases 98/99 use closeAllDoors(2,0,0,0,0)). This excludes
+      // inner switches whose first arg is `servoSequencer`, `"DC"`, etc.
+      const re = /^[ \t]*case\s+(\d+):\s*(\w+)\s*\(\s*(?:D_command\[\d+\]|\d+)/gm;
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        if (managedRegion && m.index >= managedRegion.start && m.index < managedRegion.end) continue;
+        const idx = parseInt(m[1], 10);
+        if (managedIdx.has(idx)) continue;
+        if (!cases[idx]) cases[idx] = {};
+        cases[idx][board] = m[2];
+      }
+    } catch (e) { /* missing controller file — skip silently */ }
+  }
+
+  // ── ServoSequencer.h array names ──
+  // Exclude the ones generated by this tool (Seq<baseName>BS / Seq<baseName>DC).
+  let arrays = [];
+  try {
+    const libHandle = await getFileHandlePath(root, DEPLOY.LIBRARY_PATH);
+    const libText   = await readFileText(libHandle);
+    const re = /static\s+const\s+ServoSequence\s+(\w+)\s+PROGMEM/g;
+    let m;
+    const all = [];
+    while ((m = re.exec(libText)) !== null) all.push(m[1]);
+    arrays = all.filter(n => {
+      for (const base of managedBaseNames) {
+        if (n === `${base}BS` || n === `${base}DC` || n === base) return false;
+      }
+      return true;
+    });
+  } catch (e) { /* library file missing — leave arrays empty */ }
+
+  return { cases, arrays };
+}
+
+function manageModalClose() {
+  $('manageModal').style.display = 'none';
+}
+
+function renderManageList(sequences, inventory) {
+  const total = DEPLOY.AUTO_INDEX_MAX - DEPLOY.AUTO_INDEX_START + 1;
+  inventory = inventory || { cases: {}, arrays: [] };
+
+  const sectionHdr = (title, count) =>
+    `<div style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);padding:10px 4px 6px;display:flex;align-items:center;gap:8px">
+       <span>${title}</span>
+       <span style="flex:1;height:1px;background:var(--border)"></span>
+       ${count !== undefined ? `<span style="font-weight:600;color:var(--text);text-transform:none;letter-spacing:0">${count}</span>` : ''}
+     </div>`;
+
+  // ── Section 1: Managed (editable) ──
+  let html = sectionHdr('Managed (editable)', sequences.length);
+
+  if (!sequences.length) {
+    html += `<div style="padding:14px;text-align:center;color:var(--muted);font-size:12px;border:1px dashed var(--border);border-radius:6px">
+      No tool-deployed sequences yet. Use 🚀 Apply to Controllers to deploy one.
+    </div>`;
+  } else {
+    const sortedManaged = [...sequences].sort((a, b) => (a.functionIndex || 0) - (b.functionIndex || 0));
+    html += sortedManaged.map(s => {
+      const safe    = manageEscape(s.name);
+      const safeJs  = s.name.replace(/['"\\]/g, '\\$&');
+      const updated = s.updatedAt ? new Date(s.updatedAt).toLocaleDateString() : '—';
+      const beats   = s.beats ?? '?';
+      const bpm     = s.bpm   ?? '?';
+      return `
+        <div style="display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px;background:var(--card)">
+          <div style="flex:1;min-width:0">
+            <div style="font-weight:600;font-size:13px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Seq${safe}</div>
+            <div style="font-size:11px;color:var(--muted);margin-top:2px">
+              idx <b style="color:var(--text)">${s.functionIndex}</b> · ${beats} beats @ ${bpm} BPM · updated ${manageEscape(updated)}
+            </div>
+          </div>
+          <button class="btn btn-blue btn-sm" onclick="manageLoad('${safeJs}')">Load</button>
+          <button class="btn btn-warn btn-sm" onclick="manageDelete('${safeJs}')">Delete</button>
+        </div>`;
+    }).join('');
+  }
+
+  // ── Section 2: Hand-written dispatch cases (read-only) ──
+  const caseIdxs = Object.keys(inventory.cases).map(n => parseInt(n, 10)).sort((a, b) => a - b);
+  html += sectionHdr('Hand-written cases (read-only)', caseIdxs.length);
+
+  if (!caseIdxs.length) {
+    html += `<div style="padding:10px 12px;color:var(--muted);font-size:11px;font-style:italic">
+      None found — either both .ino files are missing or every dispatch case is managed by this tool.
+    </div>`;
+  } else {
+    html += caseIdxs.map(idx => {
+      const e   = inventory.cases[idx];
+      const bs  = e.BS ? manageEscape(e.BS) : null;
+      const dc  = e.DC ? manageEscape(e.DC) : null;
+      const sameName = bs && dc && bs === dc;
+      const fnLabel  = sameName ? `${bs} <span style="font-size:10px;color:var(--muted);font-weight:400">(BS+DC)</span>`
+                     : [bs ? `${bs} <span style="font-size:10px;color:var(--bs-col);font-weight:400">(BS)</span>` : null,
+                        dc ? `${dc} <span style="font-size:10px;color:var(--dc-col);font-weight:400">(DC)</span>` : null]
+                       .filter(Boolean).join(' · ');
+      return `
+        <div style="display:flex;align-items:center;gap:10px;padding:6px 10px;border:1px solid var(--border);border-radius:6px;margin-bottom:4px;background:transparent;opacity:.78">
+          <div style="font-family:ui-monospace,Consolas,monospace;font-size:11px;color:var(--muted);min-width:44px">idx <b style="color:var(--text)">${idx}</b></div>
+          <div style="flex:1;min-width:0;font-size:12px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${fnLabel}</div>
+          <div style="font-size:10px;color:var(--muted);font-style:italic">read-only</div>
+        </div>`;
+    }).join('');
+  }
+
+  // ── Section 3: Sequence arrays defined in ServoSequencer.h ──
+  html += sectionHdr('Sequence arrays in ServoSequencer.h', inventory.arrays.length);
+  if (!inventory.arrays.length) {
+    html += `<div style="padding:10px 12px;color:var(--muted);font-size:11px;font-style:italic">No hand-written Seq* arrays found.</div>`;
+  } else {
+    const sortedArr = [...inventory.arrays].sort();
+    html += `<div style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:transparent;font-family:ui-monospace,Consolas,monospace;font-size:11px;color:var(--text);line-height:1.7;opacity:.85">
+      ${sortedArr.map(n => `<span style="display:inline-block;padding:2px 8px;margin:2px 4px 2px 0;border:1px solid var(--border);border-radius:10px;background:var(--card)">${manageEscape(n)}</span>`).join('')}
+    </div>`;
+  }
+
+  $('manageBody').innerHTML = html;
+
+  const used = sequences.filter(s =>
+    s.functionIndex >= DEPLOY.AUTO_INDEX_START && s.functionIndex <= DEPLOY.AUTO_INDEX_MAX
+  ).length;
+  $('manageFooter').innerHTML =
+    `<span>${sequences.length} managed · ${caseIdxs.length} hand-written · ${used}/${total} auto-index slots used (${DEPLOY.AUTO_INDEX_START}–${DEPLOY.AUTO_INDEX_MAX})</span>`;
+}
+
+async function manageLoad(baseName) {
+  try {
+    await loadDeployedSequence(baseName);
+    manageModalClose();
+    toast(`Loaded Seq${baseName}`);
+  } catch (e) {
+    alert(`Load failed: ${e.message}`);
+    console.error(e);
+  }
+}
+
+async function loadDeployedSequence(baseName) {
+  const root = await deployGetRoot();
+  const dir  = await root.getDirectoryHandle(DEPLOY.SEQUENCES_DIR);
+  const fh   = await dir.getFileHandle(`${baseName}.json`);
+  const data = JSON.parse(await readFileText(fh));
+
+  $('seqName').value    = data.name       || baseName;
+  $('bpmInput').value   = data.bpm        || 103.4;
+  $('numBeats').value   = data.numBeats   || 36;
+  $('pulseWidth').value = data.pulseWidth || 15;
+  $('initOffset').value = data.initOffset || 17;
+  if (data.grids?.BS) grids.BS = data.grids.BS;
+  if (data.grids?.DC) grids.DC = data.grids.DC;
+  wrapperMasks.BS = data.masks?.BS || 'ALL_SERVOS_MASK';
+  wrapperMasks.DC = data.masks?.DC || 'ALL_SERVOS_MASK';
+
+  updateBeatDisplay(); renderMasks(); renderGrid(); renderWrapperMask(); updateExport();
+}
+
+async function manageDelete(baseName) {
+  const ok = confirm(
+    `Delete Seq${baseName}?\n\n` +
+    `This will:\n` +
+    `  • Remove its wrapper + dispatch case from both .ino files\n` +
+    `  • Strip Seq${baseName}BS / Seq${baseName}DC arrays from ServoSequencer.h\n` +
+    `  • Delete sequences/${baseName}.json\n` +
+    `  • Free its function-index slot\n\n` +
+    `Recompile + upload after to use the cleaned firmware.`
+  );
+  if (!ok) return;
+
+  try {
+    await deleteSequence(baseName);
+    toast(`Deleted Seq${baseName}`);
+    // Refresh list in-place — re-read both manifest and inventory so the
+    // hand-written sections re-render with the post-delete state.
+    const root      = await deployGetRoot();
+    const manifest  = await readManifest(root);
+    const inventory = await readHandwrittenInventory(root, manifest.sequences || []);
+    renderManageList(manifest.sequences || [], inventory);
+  } catch (e) {
+    alert(`Delete failed: ${e.message}`);
+    console.error(e);
+  }
+}
+
+async function deleteSequence(baseName) {
+  const root = await deployGetRoot();
+
+  // Read manifest first so we fail loudly if the entry doesn't exist
+  const manifest = await readManifest(root);
+  const idx = manifest.sequences.findIndex(s => s.name === baseName);
+  if (idx === -1) throw new Error(`No manifest entry for "${baseName}"`);
+
+  // Read library + both .ino files
+  const libHandle  = await getFileHandlePath(root, DEPLOY.LIBRARY_PATH);
+  let   libContent = await readFileText(libHandle);
+
+  const ctlData = {};
+  for (const [name, info] of Object.entries(DEPLOY.CONTROLLERS)) {
+    const fh   = await getFileHandlePath(root, [info.folder, info.file]);
+    const text = await readFileText(fh);
+    ctlData[name] = { handle: fh, content: text };
+  }
+
+  // Manifest without this entry — drives both .ino region rebuilds
+  const remaining = manifest.sequences.filter(s => s.name !== baseName);
+
+  for (const name of Object.keys(DEPLOY.CONTROLLERS)) {
+    ctlData[name].newContent = rebuildControllerRegions(ctlData[name].content, name, remaining);
+  }
+
+  // Strip the SeqXxxBS / SeqXxxDC blocks from the .h
+  if (libContent.includes(`ServoSequence ${baseName}BS`)) libContent = removeSeqBlock(libContent, `${baseName}BS`);
+  if (libContent.includes(`ServoSequence ${baseName}DC`)) libContent = removeSeqBlock(libContent, `${baseName}DC`);
+
+  // Mutate the manifest now that all generation succeeded
+  manifest.sequences.splice(idx, 1);
+
+  // Best-effort delete of the per-sequence project JSON — its absence is not
+  // an error (user may have already deleted it manually).
+  try {
+    const seqDir = await root.getDirectoryHandle(DEPLOY.SEQUENCES_DIR);
+    await seqDir.removeEntry(`${baseName}.json`);
+  } catch {}
+
+  // Write everything (manifest last so a partial failure is detectable)
+  await writeFileText(libHandle, libContent);
+  for (const d of Object.values(ctlData)) await writeFileText(d.handle, d.newContent);
+  await writeManifest(root, manifest);
+}
+
 // ─── Resize / collapse helpers ────────────────────────────────────────────
 // Sidebar resize: drag the right edge to change width.
 // Export panel resize: drag the top edge to change height.
@@ -2126,6 +2475,7 @@ ensureGrid('BS', 36);
 ensureGrid('DC', 36);
 renderMasks();
 renderGrid();
+renderWrapperMask();
 updateBeatDisplay();
 updateExport();
 </script>
