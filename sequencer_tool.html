@@ -175,6 +175,14 @@
   /* Toast */
   #toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--surface); border: 1px solid var(--border); padding: 8px 20px; border-radius: 20px; font-size: 13px; z-index: 9999; opacity: 0; transition: opacity .25s; pointer-events: none; }
   #toast.show { opacity: 1; }
+
+  /* Deploy modal diff preview */
+  .diff-file { margin: 10px 0 4px; font-weight: 700; color: var(--text); font-size: 12px; }
+  .diff-sec  { font-size: 10px; color: var(--muted); padding: 6px 0 3px; text-transform: uppercase; letter-spacing: .5px; }
+  .diff-pre  { font-family: ui-monospace, Consolas, monospace; font-size: 11px; line-height: 1.45; white-space: pre; overflow-x: auto; padding: 5px 9px; margin: 2px 0 4px; border-radius: 4px; }
+  .diff-add  { background: rgba(76,175,80,.10); border-left: 3px solid var(--green); color: #c8e6c9; }
+  .diff-rem  { background: rgba(244,67,54,.10); border-left: 3px solid var(--red);   color: #ffcdd2; }
+  .diff-note { font-size: 10px; color: var(--muted); font-style: italic; padding: 2px 0 4px; }
 </style>
 </head>
 <body>
@@ -235,6 +243,17 @@
         <div style="font-size:10px;color:var(--muted);margin-top:5px;line-height:1.4">
           Servo group the generated wrapper plays the sequence on. Narrow this to deploy the same routine as different wrappers (e.g. CPU-only vs all panels).
         </div>
+      </div>
+    </div>
+
+    <div class="sb-sect">
+      <h3>Lights <span style="font-size:10px;color:var(--muted);text-transform:none;letter-spacing:0">(BS only)</span></h3>
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--text)">
+        <input type="checkbox" id="lightsEnable" onchange="setLightsEnabled(this.checked)">
+        <span>Turn on CBI + Data Panel</span>
+      </label>
+      <div style="font-size:10px;color:var(--muted);margin-top:6px;line-height:1.5">
+        Adds <code style="color:var(--text)">turnOnCBIandDataPanel()</code> at start of BS playback and schedules <code style="color:var(--text)">turnOffCBIandDataPanel()</code> after <b id="lightsDurEl" style="color:var(--text)">—</b>.
       </div>
     </div>
 
@@ -432,6 +451,12 @@ let activeBoard  = 'BS';
 // in the sequence — useful for deploying the same sequence twice as
 // different wrappers, each targeting a different servo group.
 const wrapperMasks = { BS: 'ALL_SERVOS_MASK', DC: 'ALL_SERVOS_MASK' };
+
+// When true, the generated BS wrapper turns CBI + Data Panel lights on at the
+// start of the sequence and schedules them off after the displayed duration.
+// Duration source: audioBuffer.duration if audio is loaded, else the sequence
+// playback time (offset + numBeats * beatCs). DC wrapper unaffected.
+let lightsEnabled = false;
 let exportTab    = 'BS';
 let selectedRow  = -1;
 let armedMask    = null;   // { servos: [...] } or null
@@ -666,6 +691,7 @@ $('audioFile').addEventListener('change', async e => {
     const cvs = $('waveformCanvas');
     cvs.style.display = 'block';
     resizeDrawWaveform();
+    updateLightsDuration();
     $('playBtn').disabled   = false;
     $('fullSongBtn').disabled = false;
     $('fullSongBtn').onclick = () => {
@@ -947,6 +973,29 @@ function setWrapperMask(name) {
   wrapperMasks[activeBoard] = name;
 }
 
+// Lights helpers — the duration source flips based on whether the user has
+// loaded audio. Re-evaluated whenever BPM/beats/offset/audio changes.
+function setLightsEnabled(v) {
+  lightsEnabled = !!v;
+  updateLightsDuration();
+}
+function getLightsDurationMs() {
+  if (audioBuffer) return Math.round(audioBuffer.duration * 1000);
+  return (getOffset() + getN() * getBeatCs()) * 10;
+}
+function updateLightsDuration() {
+  const el = $('lightsDurEl');
+  if (!el) return;
+  const ms     = getLightsDurationMs();
+  const source = audioBuffer ? 'song' : 'sequence';
+  el.textContent = `${(ms / 1000).toFixed(1)} s (${source})`;
+}
+function renderLightsState() {
+  const cb = $('lightsEnable');
+  if (cb) cb.checked = lightsEnabled;
+  updateLightsDuration();
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  PRESETS & ROW OPS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1011,8 +1060,11 @@ const fmtStep = (cs, b) => `    { ${String(cs).padStart(4)},   ${toBin(b[0])}, $
 function generateCode(board) {
   const bpm    = getBpm(), n = getN(), pulse = getPulse(), offset = getOffset();
   const beatCs = getBeatCs();
-  const base   = $('seqName').value || 'SeqMyRoutine';
-  const name   = base + board;
+  // Canonical array name = Seq<stripped><board>, matching generateWrapper and
+  // patchServoSequencerH. Stripping a leading "Seq" then re-adding it makes
+  // the name identical whether the user types "MyRoutine" or "SeqMyRoutine".
+  const base   = ($('seqName').value || 'SeqMyRoutine').replace(/^Seq/, '');
+  const name   = 'Seq' + base + board;
 
   const steps = [];
   let pending  = offset;
@@ -1081,21 +1133,24 @@ async function modifyLibrary() {
   const file    = await fh.getFile();
   let   content = await file.text();
 
-  const base   = $('seqName').value || 'SeqMyRoutine';
+  // Canonical names match generateCode's emitted arrays (Seq<stripped><board>).
+  const canon  = ($('seqName').value || 'SeqMyRoutine').replace(/^Seq/, '');
+  const nameBS = `Seq${canon}BS`;
+  const nameDC = `Seq${canon}DC`;
   const codeBS = generateCode('BS');
   const codeDC = generateCode('DC');
   const newCode = '\n' + codeBS + '\n' + codeDC;
 
   // Check for existing sequences with same name
-  const existsBS = content.includes(`SeqSequence ${base}BS`) || content.includes(`ServoSequence ${base}BS`);
-  const existsDC = content.includes(`ServoSequence ${base}DC`);
+  const existsBS = content.includes(`ServoSequence ${nameBS}`);
+  const existsDC = content.includes(`ServoSequence ${nameDC}`);
 
   if (existsBS || existsDC) {
-    const names = [existsBS && `${base}BS`, existsDC && `${base}DC`].filter(Boolean).join(' and ');
+    const names = [existsBS && nameBS, existsDC && nameDC].filter(Boolean).join(' and ');
     if (!confirm(`${names} already exist in the file. Replace them?`)) return;
-    // Remove existing blocks
-    if (existsBS) content = removeSeqBlock(content, `${base}BS`);
-    if (existsDC) content = removeSeqBlock(content, `${base}DC`);
+    // Remove ALL existing copies (older buggy deploys may have duplicated them)
+    content = removeAllSeqBlocks(content, nameBS);
+    content = removeAllSeqBlocks(content, nameDC);
   }
 
   // Insert before #endif (or append)
@@ -1144,6 +1199,18 @@ function removeSeqBlock(content, seqName) {
   return content.slice(0, lineStart) + content.slice(end);
 }
 
+// Strips every static const ServoSequence <seqName> PROGMEM block. Loops until
+// removeSeqBlock makes no change (safe — it returns content unmodified once
+// none remain, so this can't spin).
+function removeAllSeqBlocks(content, seqName) {
+  let prev;
+  do {
+    prev = content;
+    content = removeSeqBlock(content, seqName);
+  } while (content !== prev);
+  return content;
+}
+
 function downloadText(text, filename) {
   const a  = document.createElement('a');
   a.href   = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
@@ -1161,6 +1228,7 @@ function updateBeatDisplay() {
   $('beatCsDisplay').textContent = `${beatCs} cs`;
   $('beatSecDisplay').textContent = `${(beatCs / 100).toFixed(3)} s / beat`;
   updateInfo(); updateExport();
+  updateLightsDuration();
   if (audioBuffer) drawWaveform();
 }
 function updateInfo() {
@@ -1199,7 +1267,10 @@ function saveProject() {
     name: $('seqName').value, bpm: getBpm(), numBeats: getN(),
     pulseWidth: getPulse(), initOffset: getOffset(),
     grids: { BS: grids.BS, DC: grids.DC },
-    masks: { BS: wrapperMasks.BS, DC: wrapperMasks.DC }
+    masks: { BS: wrapperMasks.BS, DC: wrapperMasks.DC },
+    lights: lightsEnabled
+      ? { enabled: true, durationMs: getLightsDurationMs() }
+      : null
   };
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
@@ -1223,7 +1294,8 @@ function loadProject(input) {
       if (d.grids?.DC) grids.DC = d.grids.DC;
       wrapperMasks.BS = d.masks?.BS || 'ALL_SERVOS_MASK';
       wrapperMasks.DC = d.masks?.DC || 'ALL_SERVOS_MASK';
-      updateBeatDisplay(); renderMasks(); renderGrid(); renderWrapperMask(); updateExport();
+      lightsEnabled = !!(d.lights && d.lights.enabled);
+      updateBeatDisplay(); renderMasks(); renderGrid(); renderWrapperMask(); renderLightsState(); updateExport();
       toast('Project loaded');
     } catch (err) { alert('Load failed: ' + err.message); }
   };
@@ -1254,7 +1326,7 @@ $('pulseWidth').addEventListener('input', () => { updateExport(); updateInfo(); 
 $('numBeats').addEventListener('change', () => {
   const n = getN();
   ensureGrid('BS', n); ensureGrid('DC', n);
-  renderGrid(); updateExport();
+  renderGrid(); updateExport(); updateLightsDuration();
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1701,7 +1773,7 @@ function functionNameFor(baseName) {
   return n.charAt(0).toLowerCase() + n.slice(1);
 }
 
-function generateWrapper(boardName, baseName, funcIndex, mask) {
+function generateWrapper(boardName, baseName, funcIndex, mask, lights) {
   const ctrl = DEPLOY.CONTROLLERS[boardName];
   const fn   = functionNameFor(baseName);
   const seq  = `Seq${baseName.replace(/^Seq/, '')}${boardName}`;
@@ -1714,8 +1786,29 @@ function generateWrapper(boardName, baseName, funcIndex, mask) {
   }
   const idx  = funcIndex.toString().padStart(2, '0');
   const cmd  = `${ctrl.cmdPrefix}${idx}E%02d%04d%04d`;
+
+  // Lights are BS-only — the CBI + Data Panel relays are wired to the Body
+  // Servo Controller. DC wrappers ignore the flag.
+  const useLights = !!(lights && lights.enabled && boardName === 'BS');
+  const dMs       = useLights ? Math.max(0, Math.round(lights.durationMs || 0)) : 0;
+
+  // Cases 1 and 3 play the sequence locally on BS — lights tied to that play.
+  // Case 4 plays locally inside a DelayCall after sending ESP-NOW first, so
+  // both the on call and the off schedule are time-shifted by delayCallDuration.
+  // Case 2 is ESP-NOW-only (BS doesn't play), so no lights here.
+  const onLocal  = useLights ? 'turnOnCBIandDataPanel(); ' : '';
+  const offLocal = useLights ? `\n            DelayCall::schedule([]{ turnOffCBIandDataPanel(); }, ${dMs});` : '';
+  const case4Body = useLights
+    ? `sendESPNOWCommand("${ctrl.espnowPeer}", stringToSend);
+            DelayCall::schedule([]{ turnOnCBIandDataPanel(); SEQUENCE_PLAY_ONCE_VARSPEED(servoSequencer, ${seq}, ${mask}, fVarSpeedMin, fVarSpeedMax); }, delayCallDuration);
+            DelayCall::schedule([]{ turnOffCBIandDataPanel(); }, delayCallDuration + ${dMs});`
+    : `sendESPNOWCommand("${ctrl.espnowPeer}", stringToSend);
+            DelayCall::schedule([]{ SEQUENCE_PLAY_ONCE_VARSPEED(servoSequencer, ${seq}, ${mask}, fVarSpeedMin, fVarSpeedMax); }, delayCallDuration);`;
+
+  const lightsTag = useLights ? `, lights ${(dMs/1000).toFixed(1)}s` : '';
+
   return `
-// Auto-generated wrapper for ${seq} — function index ${funcIndex}
+// Auto-generated wrapper for ${seq} — function index ${funcIndex}${lightsTag}
 void ${fn}(int servoBoard, int servoEasingMethod, uint32_t varSpeedMin, uint32_t varSpeedMax, uint32_t delayCallDuration) {
   Debug.SERVO("Play ${fn}\\n");
   fVarSpeedMin = varSpeedMin;
@@ -1724,12 +1817,11 @@ void ${fn}(int servoBoard, int servoEasingMethod, uint32_t varSpeedMin, uint32_t
   snprintf(stringToSend, sizeof(stringToSend), "${cmd}", servoEasingMethod, varSpeedMin, varSpeedMax);
   setServoEasingMethod(servoEasingMethod);
   switch (servoBoard) {
-    case 1: SEQUENCE_PLAY_ONCE_VARSPEED(servoSequencer, ${seq}, ${mask}, fVarSpeedMin, fVarSpeedMax); break;
+    case 1: ${onLocal}SEQUENCE_PLAY_ONCE_VARSPEED(servoSequencer, ${seq}, ${mask}, fVarSpeedMin, fVarSpeedMax);${offLocal} break;
     case 2: sendESPNOWCommand("${ctrl.espnowPeer}", stringToSend); break;
-    case 3: SEQUENCE_PLAY_ONCE_VARSPEED(servoSequencer, ${seq}, ${mask}, varSpeedMin, varSpeedMax);
-            DelayCall::schedule([]{ sendESPNOWCommand("${ctrl.espnowPeer}", stringToSend); }, delayCallDuration); break;
-    case 4: sendESPNOWCommand("${ctrl.espnowPeer}", stringToSend);
-            DelayCall::schedule([]{ SEQUENCE_PLAY_ONCE_VARSPEED(servoSequencer, ${seq}, ${mask}, fVarSpeedMin, fVarSpeedMax); }, delayCallDuration); break;
+    case 3: ${onLocal}SEQUENCE_PLAY_ONCE_VARSPEED(servoSequencer, ${seq}, ${mask}, varSpeedMin, varSpeedMax);
+            DelayCall::schedule([]{ sendESPNOWCommand("${ctrl.espnowPeer}", stringToSend); }, delayCallDuration);${offLocal} break;
+    case 4: ${case4Body} break;
   }
   D_command[0] = '\\0';
 }
@@ -1751,7 +1843,7 @@ function rebuildControllerRegions(content, boardName, sequences) {
   const defMask = DEPLOY.CONTROLLERS[boardName].defaultMask;
 
   const wrappers = sorted
-    .map(s => generateWrapper(boardName, s.name, s.functionIndex, (s.masks && s.masks[boardName]) || defMask))
+    .map(s => generateWrapper(boardName, s.name, s.functionIndex, (s.masks && s.masks[boardName]) || defMask, s.lights))
     .join('\n');
   content = replaceRegion(content, DEPLOY.MARK.wrapStart, DEPLOY.MARK.wrapEnd, wrappers);
   if (content === null) throw new Error(`[${boardName}] wrapper region replace failed`);
@@ -1768,13 +1860,16 @@ function rebuildControllerRegions(content, boardName, sequences) {
 // ─── Patch one controller (.ino) file for an add/re-save ──────────────────
 // Builds a merged manifest snapshot (existing + current entry) and hands it
 // to rebuildControllerRegions. Does NOT mutate the caller's manifest.
-function patchController(content, boardName, manifest, baseName, funcIndex, mask) {
+function patchController(content, boardName, manifest, baseName, funcIndex, mask, lights) {
   const prior = manifest.sequences.find(s => s.name === baseName) || {};
   const merged = manifest.sequences.filter(s => s.name !== baseName).concat([{
     ...prior,
     name: baseName,
     functionIndex: funcIndex,
-    masks: { ...(prior.masks || {}), [boardName]: mask },
+    masks:  { ...(prior.masks || {}), [boardName]: mask },
+    // Lights are per-sequence (BS only effectively, but stored at the entry
+    // level so DC rebuilds still find the same value). null clears it.
+    lights: lights === undefined ? prior.lights : lights,
   }]);
   return rebuildControllerRegions(content, boardName, merged);
 }
@@ -1782,9 +1877,14 @@ function patchController(content, boardName, manifest, baseName, funcIndex, mask
 // ─── Patch ServoSequencer.h (already supported by modifyLibrary, but we
 // don't want to re-open a picker; this version uses the cached root). ─────
 function patchServoSequencerH(content, baseName, codeBS, codeDC) {
-  // Remove existing blocks for this base name (replacement)
-  if (content.includes(`ServoSequence ${baseName}BS`)) content = removeSeqBlock(content, `${baseName}BS`);
-  if (content.includes(`ServoSequence ${baseName}DC`)) content = removeSeqBlock(content, `${baseName}DC`);
+  // baseName arrives already stripped of any leading "Seq". The emitted array
+  // name is Seq<baseName><board> (see generateCode), so look for that exact
+  // name — the old code searched for the un-prefixed name and never matched,
+  // which is why repeat deploys piled up duplicate definitions.
+  // Remove ALL existing copies (a previous buggy build may have appended
+  // several) before inserting the fresh pair.
+  content = removeAllSeqBlocks(content, `Seq${baseName}BS`);
+  content = removeAllSeqBlocks(content, `Seq${baseName}DC`);
 
   const newCode = '\n' + codeBS + '\n' + codeDC;
   const endifIdx = content.lastIndexOf('#endif');
@@ -1794,95 +1894,6 @@ function patchServoSequencerH(content, baseName, codeBS, codeDC) {
     content += newCode;
   }
   return content;
-}
-
-// ─── Top-level orchestrator ───────────────────────────────────────────────
-async function applyToControllers() {
-  const baseRaw = ($('seqName').value || '').trim();
-  if (!baseRaw) { alert('Set a sequence name first (top bar "Name" field).'); return; }
-  // Strip leading "Seq" so internally we deal with the base and add Seq/BS/DC
-  // suffixes ourselves when generating.
-  const baseName = baseRaw.replace(/^Seq/, '');
-  if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(baseName)) {
-    alert(`Invalid sequence name "${baseRaw}". Use letters/digits/underscore only, starting with a letter (optionally prefixed with "Seq").`);
-    return;
-  }
-
-  toast('Picking project folder…');
-  let root;
-  try { root = await deployGetRoot(); }
-  catch (e) { alert(`Couldn't access project folder: ${e.message}`); return; }
-  deployUpdateStatus();
-
-  try {
-    // 1. Read everything we're going to touch
-    toast('Reading controller files…');
-    const libHandle  = await getFileHandlePath(root, DEPLOY.LIBRARY_PATH);
-    const libContent = await readFileText(libHandle);
-
-    const ctlData = {};
-    for (const [name, info] of Object.entries(DEPLOY.CONTROLLERS)) {
-      const fh   = await getFileHandlePath(root, [info.folder, info.file]);
-      const text = await readFileText(fh);
-      ctlData[name] = { handle: fh, content: text, mask: info.defaultMask };
-    }
-
-    const manifest = await readManifest(root);
-    const funcIndex = pickFunctionIndex(manifest, baseName,
-      Object.fromEntries(Object.entries(ctlData).map(([k, v]) => [k, v.content])));
-
-    // 2. Generate new ServoSequencer.h content
-    toast('Patching ServoSequencer.h…');
-    const codeBS = generateCode('BS');   // existing function — produces SeqXxxBS array
-    const codeDC = generateCode('DC');
-    const newLib = patchServoSequencerH(libContent, baseName, codeBS, codeDC);
-
-    // 3. Generate new .ino content for each controller
-    toast('Injecting wrappers + cases…');
-    for (const [name, d] of Object.entries(ctlData)) {
-      d.newContent = patchController(d.content, name, manifest, baseName, funcIndex, d.mask);
-    }
-
-    // 4. Update / append manifest entry (in-memory)
-    const idx = manifest.sequences.findIndex(s => s.name === baseName);
-    const entry = {
-      name:          baseName,
-      functionIndex: funcIndex,
-      bpm:           getBpm(),
-      beats:         getN(),
-      pulse:         getPulse(),
-      offset:        getOffset(),
-      masks:         { BS: ctlData.BS.mask, DC: ctlData.DC.mask },
-      updatedAt:     new Date().toISOString(),
-    };
-    if (idx === -1) { entry.createdAt = entry.updatedAt; manifest.sequences.push(entry); }
-    else            { entry.createdAt = manifest.sequences[idx].createdAt || entry.updatedAt; manifest.sequences[idx] = entry; }
-
-    // 5. Per-sequence project JSON (re-loadable later)
-    const project = {
-      version:    1,
-      name:       baseName,
-      bpm:        getBpm(),
-      numBeats:   getN(),
-      pulseWidth: getPulse(),
-      initOffset: getOffset(),
-      grids:      { BS: grids.BS, DC: grids.DC },
-      masks:      entry.masks,
-      updatedAt:  entry.updatedAt,
-    };
-
-    // 6. Write everything (manifest last so a partial failure is detectable)
-    toast('Writing files…');
-    await writeFileText(libHandle, newLib);
-    for (const d of Object.values(ctlData)) await writeFileText(d.handle, d.newContent);
-    await writeSequenceJson(root, baseName, project);
-    await writeManifest(root, manifest);
-
-    toast(`✓ Deployed Seq${baseName} (index ${funcIndex}) — recompile + upload to use.`);
-  } catch (err) {
-    console.error(err);
-    alert(`Apply failed:\n\n${err.message}\n\nCheck the JS console for details. No partial writes if this fired before "Writing files…" step.`);
-  }
 }
 
 // ─── Deploy status modal helpers ──────────────────────────────────────────
@@ -1916,6 +1927,151 @@ function deployLogPath(label, path) {
   line.style.paddingLeft = '20px';
   line.textContent = `${label}: ${path}`;
   $('deployLog').appendChild(line);
+}
+
+// ─── Pre-existing duplicate scanner ───────────────────────────────────────
+// Catches the failure mode that bit us before: duplicate ServoSequence array
+// definitions in the .h, duplicate wrapper function defs, or duplicate
+// dispatch-case values in a .ino — all of which are hard compile errors.
+// Non-blocking: it only warns. Re-deploying a sequence self-heals duplicates
+// of its OWN name/index; anything else needs manual cleanup.
+function scanForDuplicates(libContent, controllers) {
+  const warnings = [];
+  let m;
+
+  // ServoSequencer.h — repeated `static const ServoSequence NAME PROGMEM`
+  const seqCounts = {};
+  const seqRe = /static\s+const\s+ServoSequence\s+(\w+)\s+PROGMEM/g;
+  while ((m = seqRe.exec(libContent)) !== null) seqCounts[m[1]] = (seqCounts[m[1]] || 0) + 1;
+  for (const [name, n] of Object.entries(seqCounts)) {
+    if (n > 1) warnings.push({ file: DEPLOY.LIBRARY_PATH.join('/'), detail: `ServoSequence ${name} defined ${n}× — redefinition error` });
+  }
+
+  for (const c of Object.values(controllers)) {
+    const text = c.content || '';
+
+    // Wrapper redefinitions: `void name(int servoBoard, …`
+    const fnCounts = {};
+    const fnRe = /^\s*void\s+(\w+)\s*\(\s*int\s+servoBoard\b/gm;
+    while ((m = fnRe.exec(text)) !== null) fnCounts[m[1]] = (fnCounts[m[1]] || 0) + 1;
+    for (const [name, n] of Object.entries(fnCounts)) {
+      if (n > 1) warnings.push({ file: c.path, detail: `void ${name}(int servoBoard,…) defined ${n}× — redefinition error` });
+    }
+
+    // Duplicate dispatch-case values (dispatch-shaped lines only — same
+    // heuristic as the hand-written-inventory scanner, so inner switches
+    // whose first arg is servoSequencer/"DC"/etc. are ignored).
+    const caseCounts = {};
+    const caseRe = /^[ \t]*case\s+(\d+):\s*\w+\s*\(\s*(?:D_command\[\d+\]|\d+)/gm;
+    while ((m = caseRe.exec(text)) !== null) {
+      const idx = m[1];
+      caseCounts[idx] = (caseCounts[idx] || 0) + 1;
+    }
+    for (const [idx, n] of Object.entries(caseCounts)) {
+      if (n > 1) warnings.push({ file: c.path, detail: `case ${idx}: appears ${n}× in the dispatch switch — duplicate case value` });
+    }
+  }
+
+  return warnings;
+}
+
+// ─── Diff preview helpers ─────────────────────────────────────────────────
+// Pulls the exact text of a static const ServoSequence <seqName> PROGMEM block
+// including any preceding "// " comment lines (the code generator writes a
+// 3-line header). Returns null if not found.
+function extractSeqBlockText(content, seqName) {
+  const seqDecl = `static const ServoSequence ${seqName} PROGMEM`;
+  const start = content.indexOf(seqDecl);
+  if (start === -1) return null;
+  let lineStart = content.lastIndexOf('\n', start - 1) + 1;
+  while (lineStart > 0) {
+    const prevLine = content.lastIndexOf('\n', lineStart - 2) + 1;
+    const line = content.slice(prevLine, lineStart - 1).trim();
+    if (line.startsWith('//')) lineStart = prevLine; else break;
+  }
+  let end = content.indexOf('};', start);
+  if (end === -1) return null;
+  end += 2;
+  return content.slice(lineStart, end);
+}
+
+function deployLogFile(path) {
+  const el = document.createElement('div');
+  el.className = 'diff-file';
+  el.textContent = `📄 ${path}`;
+  $('deployLog').appendChild(el);
+}
+function deployLogSection(label) {
+  const el = document.createElement('div');
+  el.className = 'diff-sec';
+  el.textContent = label;
+  $('deployLog').appendChild(el);
+}
+function deployLogDiffNote(text) {
+  const el = document.createElement('div');
+  el.className = 'diff-note';
+  el.textContent = text;
+  $('deployLog').appendChild(el);
+}
+function deployLogDiffBlock(text, kind) {
+  if (!text) return;
+  const el = document.createElement('pre');
+  el.className = `diff-pre diff-${kind}`;
+  el.textContent = text;
+  $('deployLog').appendChild(el);
+}
+
+// Renders a per-region diff inside the deploy modal so the user can review
+// exactly what will be written before clicking "Write files". For the .h, we
+// pull the SeqXxxBS/SeqXxxDC blocks before and after. For each .ino, we read
+// the marker-region bodies before and after.
+function renderDeployDiff(plan, libOld, libNew, newControllerContents, baseName) {
+  deployLog('Diff preview — review before writing:', 'step');
+
+  // ── ServoSequencer.h ──
+  deployLogFile(plan.libPath);
+  let libChanged = false;
+  for (const sfx of ['BS', 'DC']) {
+    const name     = `${baseName}${sfx}`;
+    const oldBlock = extractSeqBlockText(libOld, name);
+    const newBlock = extractSeqBlockText(libNew, name);
+    if (!oldBlock && !newBlock) continue;
+    deployLogSection(`Seq${name} array`);
+    if (oldBlock && oldBlock === newBlock) {
+      deployLogDiffNote('(no change)');
+    } else {
+      if (oldBlock) deployLogDiffBlock(oldBlock, 'rem');
+      if (newBlock) deployLogDiffBlock(newBlock, 'add');
+      libChanged = true;
+    }
+  }
+  if (!libChanged) deployLogDiffNote('(no array changes detected for this name)');
+
+  // ── Each .ino ──
+  for (const [name, c] of Object.entries(plan.controllers)) {
+    deployLogFile(c.path);
+    const newText = newControllerContents[name];
+
+    const regions = [
+      ['Wrapper region', DEPLOY.MARK.wrapStart, DEPLOY.MARK.wrapEnd],
+      ['Case region',    DEPLOY.MARK.caseStart, DEPLOY.MARK.caseEnd],
+    ];
+    let anyChange = false;
+    for (const [label, mStart, mEnd] of regions) {
+      const oldR = findRegion(c.content, mStart, mEnd);
+      const newR = findRegion(newText, mStart, mEnd);
+      const oldBody = oldR ? oldR.body.replace(/^\n|\n$/g, '') : '';
+      const newBody = newR ? newR.body.replace(/^\n|\n$/g, '') : '';
+      if (oldR && newR && oldBody === newBody) continue;
+
+      deployLogSection(label);
+      if (!oldR) deployLogDiffNote(`Marker pair will be inserted into ${c.path}.`);
+      if (oldBody) deployLogDiffBlock(oldBody, 'rem');
+      if (newBody) deployLogDiffBlock(newBody, 'add');
+      anyChange = true;
+    }
+    if (!anyChange) deployLogDiffNote('(no region changes — wrappers and cases match what is on disk)');
+  }
 }
 
 // ─── Pre-flight check: confirms every expected file/folder exists before
@@ -2020,6 +2176,21 @@ async function applyToControllers() {
     return;
   }
 
+  deployLog('Scanning for pre-existing duplicates…', 'step');
+  try {
+    const dups = scanForDuplicates(libContent, plan.controllers);
+    if (dups.length) {
+      deployLog(`${dups.length} pre-existing duplicate definition(s) — these will fail compilation if not resolved:`, 'warn');
+      for (const d of dups) deployLogPath('  ⚠', `${d.file}: ${d.detail}`);
+      deployLog('Re-deploying THIS sequence auto-cleans duplicates of its own name/index (check the diff below). Others must be removed via 📋 Sequences → Delete or by hand.', 'info');
+    } else {
+      deployLog('No pre-existing duplicates detected.', 'ok');
+    }
+  } catch (e) {
+    deployLog(`Duplicate scan failed (continuing): ${e.message}`, 'warn');
+    console.error(e);
+  }
+
   deployLog('Loading manifest + allocating function index…', 'step');
   let manifest, funcIndex;
   try {
@@ -2035,6 +2206,11 @@ async function applyToControllers() {
   }
 
   deployLog('Generating injection payloads…', 'step');
+  // Snapshot current lights settings — null clears any prior config so toggling
+  // off and re-deploying works as expected.
+  const lightsConfig = lightsEnabled
+    ? { enabled: true, durationMs: getLightsDurationMs() }
+    : null;
   let newLib, newControllerContents;
   try {
     const codeBS = generateCode('BS');
@@ -2042,13 +2218,22 @@ async function applyToControllers() {
     newLib = patchServoSequencerH(libContent, baseName, codeBS, codeDC);
     newControllerContents = {};
     for (const [name, c] of Object.entries(plan.controllers)) {
-      newControllerContents[name] = patchController(c.content, name, manifest, baseName, funcIndex, c.mask);
+      newControllerContents[name] = patchController(c.content, name, manifest, baseName, funcIndex, c.mask, lightsConfig);
     }
     deployLog('Payloads generated cleanly — nothing has been written yet.', 'ok');
+    if (lightsConfig) deployLog(`Lights: on, off after ${(lightsConfig.durationMs / 1000).toFixed(1)}s (BS wrapper)`, 'info');
   } catch (e) {
     deployLog(`Code generation failed: ${e.message}`, 'err');
     console.error(e);
     return;
+  }
+
+  // Show what's about to change so the user can review before committing.
+  try {
+    renderDeployDiff(plan, libContent, newLib, newControllerContents, baseName);
+  } catch (e) {
+    deployLog(`Diff preview failed (continuing): ${e.message}`, 'warn');
+    console.error(e);
   }
 
   // Build a confirmable plan
@@ -2074,6 +2259,7 @@ async function applyToControllers() {
         pulse:         getPulse(),
         offset:        getOffset(),
         masks:         { BS: plan.controllers.BS.mask, DC: plan.controllers.DC.mask },
+        lights:        lightsConfig,  // null when disabled
         updatedAt:     now,
       };
       if (idx === -1) { entry.createdAt = now; manifest.sequences.push(entry); }
@@ -2082,7 +2268,8 @@ async function applyToControllers() {
       const project = {
         version: 1, name: baseName, bpm: getBpm(), numBeats: getN(),
         pulseWidth: getPulse(), initOffset: getOffset(),
-        grids: { BS: grids.BS, DC: grids.DC }, masks: entry.masks, updatedAt: now,
+        grids: { BS: grids.BS, DC: grids.DC }, masks: entry.masks,
+        lights: entry.lights, updatedAt: now,
       };
       await writeSequenceJson(root, baseName, project);
       deployLog(`Wrote sequences/${baseName}.json`, 'ok');
@@ -2322,8 +2509,9 @@ async function loadDeployedSequence(baseName) {
   if (data.grids?.DC) grids.DC = data.grids.DC;
   wrapperMasks.BS = data.masks?.BS || 'ALL_SERVOS_MASK';
   wrapperMasks.DC = data.masks?.DC || 'ALL_SERVOS_MASK';
+  lightsEnabled = !!(data.lights && data.lights.enabled);
 
-  updateBeatDisplay(); renderMasks(); renderGrid(); renderWrapperMask(); updateExport();
+  updateBeatDisplay(); renderMasks(); renderGrid(); renderWrapperMask(); renderLightsState(); updateExport();
 }
 
 async function manageDelete(baseName) {
@@ -2476,6 +2664,7 @@ ensureGrid('DC', 36);
 renderMasks();
 renderGrid();
 renderWrapperMask();
+renderLightsState();
 updateBeatDisplay();
 updateExport();
 </script>
